@@ -277,18 +277,27 @@ func createBOM(c *gin.Context) {
 			return err
 		}
 
-		var lastBOM BOM
-		version := 1
+		var bomCount int64
 
-		err := tx.Where("product_id = ?", productID).
-			Order("version DESC").
-			First(&lastBOM).Error
+if err := tx.Model(&BOM{}).
+    Where("product_id = ?", productID).
+    Count(&bomCount).Error; err != nil {
+    return err
+}
 
-		if err == nil {
-			version = lastBOM.Version + 1
-		} else if err != gorm.ErrRecordNotFound {
-			return err
-		}
+version := 1
+
+if bomCount > 0 {
+    var lastBOM BOM
+
+    if err := tx.Where("product_id = ?", productID).
+        Order("version DESC").
+        First(&lastBOM).Error; err != nil {
+        return err
+    }
+
+    version = lastBOM.Version + 1
+}
 
 		for _, item := range req.Items {
 			if item.MaterialID == 0 || item.Quantity <= 0 || item.Unit == "" {
