@@ -93,3 +93,26 @@ type WorkOrderItem struct {
 
     Material Material `gorm:"foreignKey:MaterialID" json:"material"`
 }
+
+// Sales Order
+type SalesOrder struct {
+    ID           uint      `gorm:"primaryKey" json:"id"`
+    OrderNumber  string    `gorm:"uniqueIndex;not null" json:"order_number"`
+    CustomerName string    `gorm:"not null" json:"customer_name"`
+    Status       string    `gorm:"not null;default:RESERVED" json:"status"`
+
+    Items []SalesOrderItem `gorm:"foreignKey:SalesOrderID" json:"items"`
+
+    CreatedAt time.Time `json:"created_at"`
+    UpdatedAt time.Time `json:"updated_at"`
+}
+
+// Sales Order Item
+type SalesOrderItem struct {
+    ID           uint    `gorm:"primaryKey" json:"id"`
+    SalesOrderID uint    `gorm:"not null;index" json:"sales_order_id"`
+    ProductID    uint    `gorm:"not null" json:"product_id"`
+    Quantity     float64 `gorm:"not null" json:"quantity"`
+
+    Product Product `gorm:"foreignKey:ProductID" json:"product"`
+}

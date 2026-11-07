@@ -9,6 +9,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 )
 
@@ -16,7 +17,8 @@ var db *gorm.DB
 
 func setupRoutes() *gin.Engine {
 	r := gin.Default()
-
+	r.Use(cors.Default())
+	
 	api := r.Group("/api")
 	{
 		api.GET("/materials", getMaterials)
@@ -38,6 +40,12 @@ func setupRoutes() *gin.Engine {
 		api.GET("/work-orders", getWorkOrders)
 		api.POST("/work-orders/:id/complete", completeWorkOrder)
 		api.GET("/inventory/products", getProductInventory)
+        
+        // SALES ORDERS
+        api.POST("/sales-orders", createSalesOrder)
+        api.GET("/sales-orders", getSalesOrders)
+        api.POST("/sales-orders/:id/ship", shipSalesOrder)
+        api.POST("/sales-orders/:id/cancel", cancelSalesOrder)
 		
 	}
 
@@ -818,4 +826,333 @@ func getProductInventory(c *gin.Context) {
         "message": "Data inventory produk berhasil diambil",
         "data":    results,
     })
+}
+
+// ==========================================
+// SALES ORDER
+// ==========================================
+
+type CreateSalesOrderRequest struct {
+	CustomerName string `json:"customer_name" binding:"required"`
+	Items []struct {
+		ProductID uint    `json:"product_id" binding:"required"`
+		Quantity  float64 `json:"quantity" binding:"required,gt=0"`
+	} `json:"items" binding:"required,min=1"`
+}
+
+// Membuat Sales Order dan reservasi produk
+func createSalesOrder(c *gin.Context) {
+	var req CreateSalesOrderRequest
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Data Sales Order tidak valid",
+		})
+		return
+	}
+
+	if len(req.Items) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Sales Order harus memiliki minimal satu produk",
+		})
+		return
+	}
+
+	// Cegah product ID duplikat dalam satu pesanan.
+	seen := make(map[uint]bool)
+
+	for _, item := range req.Items {
+		if item.ProductID == 0 || item.Quantity <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "Produk dan quantity harus valid",
+			})
+			return
+		}
+
+		if seen[item.ProductID] {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "Produk yang sama tidak boleh dimasukkan dua kali",
+			})
+			return
+		}
+
+		seen[item.ProductID] = true
+	}
+
+	var result SalesOrder
+
+	err := db.Transaction(func(tx *gorm.DB) error {
+		productIDs := make([]uint, 0, len(req.Items))
+
+		for _, item := range req.Items {
+			productIDs = append(productIDs, item.ProductID)
+		}
+
+		// Urutkan ID untuk menghindari deadlock.
+		sort.Slice(productIDs, func(i, j int) bool {
+			return productIDs[i] < productIDs[j]
+		})
+
+		// Reservasi stok setiap produk.
+		for _, productID := range productIDs {
+			var inventory ProductInventory
+
+			if err := tx.Clauses(clause.Locking{
+				Strength: "UPDATE",
+			}).Where("product_id = ?", productID).
+				First(&inventory).Error; err != nil {
+				return fmt.Errorf(
+					"inventory produk %d tidak ditemukan",
+					productID,
+				)
+			}
+
+			var requested float64
+
+			for _, item := range req.Items {
+				if item.ProductID == productID {
+					requested = item.Quantity
+					break
+				}
+			}
+
+			available := inventory.OnHand - inventory.Reserved
+
+			if available < requested {
+				return fmt.Errorf(
+					"stok produk %d tidak mencukupi: tersedia %.2f, dibutuhkan %.2f",
+					productID,
+					available,
+					requested,
+				)
+			}
+
+			inventory.Reserved += requested
+
+			if err := tx.Save(&inventory).Error; err != nil {
+				return err
+			}
+		}
+
+		result = SalesOrder{
+			OrderNumber: fmt.Sprintf("SO-%d", time.Now().UnixNano()),
+			CustomerName: req.CustomerName,
+			Status: "RESERVED",
+		}
+
+		if err := tx.Create(&result).Error; err != nil {
+			return err
+		}
+
+		for _, item := range req.Items {
+			salesItem := SalesOrderItem{
+				SalesOrderID: result.ID,
+				ProductID: item.ProductID,
+				Quantity: item.Quantity,
+			}
+
+			if err := tx.Create(&salesItem).Error; err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": err.Error(),
+		})
+		return
+	}
+
+	db.Preload("Items.Product").First(&result, result.ID)
+
+	c.JSON(http.StatusCreated, gin.H{
+		"message": "Sales Order berhasil dibuat dan stok berhasil direservasi",
+		"data": result,
+	})
+}
+
+// Melihat seluruh Sales Order
+func getSalesOrders(c *gin.Context) {
+	var orders []SalesOrder
+
+	if err := db.Preload("Items.Product").
+		Order("created_at DESC").
+		Find(&orders).Error; err != nil {
+
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Gagal mengambil Sales Order",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Data Sales Order berhasil diambil",
+		"data": orders,
+	})
+}
+
+// Mengirim pesanan
+func shipSalesOrder(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "ID Sales Order tidak valid",
+		})
+		return
+	}
+
+	err = db.Transaction(func(tx *gorm.DB) error {
+		var order SalesOrder
+
+		// Kunci Sales Order.
+		if err := tx.Clauses(clause.Locking{
+			Strength: "UPDATE",
+		}).First(&order, id).Error; err != nil {
+			return fmt.Errorf("Sales Order tidak ditemukan")
+		}
+
+		if order.Status != "RESERVED" {
+			return fmt.Errorf("Sales Order tidak dalam status RESERVED")
+		}
+
+		var items []SalesOrderItem
+
+		if err := tx.Where("sales_order_id = ?", order.ID).
+			Find(&items).Error; err != nil {
+			return err
+		}
+
+		sort.Slice(items, func(i, j int) bool {
+			return items[i].ProductID < items[j].ProductID
+		})
+
+		for _, item := range items {
+			var inventory ProductInventory
+
+			if err := tx.Clauses(clause.Locking{
+				Strength: "UPDATE",
+			}).Where("product_id = ?", item.ProductID).
+				First(&inventory).Error; err != nil {
+				return err
+			}
+
+			if inventory.OnHand < item.Quantity ||
+				inventory.Reserved < item.Quantity {
+				return fmt.Errorf(
+					"stok produk %d tidak mencukupi untuk pengiriman",
+					item.ProductID,
+				)
+			}
+
+			inventory.OnHand -= item.Quantity
+			inventory.Reserved -= item.Quantity
+
+			if err := tx.Save(&inventory).Error; err != nil {
+				return err
+			}
+		}
+
+		order.Status = "SHIPPED"
+
+		return tx.Save(&order).Error
+	})
+
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Pesanan berhasil dikirim",
+		"data": gin.H{
+			"sales_order_id": id,
+			"status": "SHIPPED",
+		},
+	})
+}
+
+// Membatalkan Sales Order
+func cancelSalesOrder(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "ID Sales Order tidak valid",
+		})
+		return
+	}
+
+	err = db.Transaction(func(tx *gorm.DB) error {
+		var order SalesOrder
+
+		if err := tx.Clauses(clause.Locking{
+			Strength: "UPDATE",
+		}).First(&order, id).Error; err != nil {
+			return fmt.Errorf("Sales Order tidak ditemukan")
+		}
+
+		if order.Status != "RESERVED" {
+			return fmt.Errorf("Hanya Sales Order RESERVED yang dapat dibatalkan")
+		}
+
+		var items []SalesOrderItem
+
+		if err := tx.Where("sales_order_id = ?", order.ID).
+			Find(&items).Error; err != nil {
+			return err
+		}
+
+		sort.Slice(items, func(i, j int) bool {
+			return items[i].ProductID < items[j].ProductID
+		})
+
+		for _, item := range items {
+			var inventory ProductInventory
+
+			if err := tx.Clauses(clause.Locking{
+				Strength: "UPDATE",
+			}).Where("product_id = ?", item.ProductID).
+				First(&inventory).Error; err != nil {
+				return err
+			}
+
+			if inventory.Reserved < item.Quantity {
+				return fmt.Errorf(
+					"reserved produk %d tidak mencukupi",
+					item.ProductID,
+				)
+			}
+
+			inventory.Reserved -= item.Quantity
+
+			if err := tx.Save(&inventory).Error; err != nil {
+				return err
+			}
+		}
+
+		order.Status = "CANCELLED"
+
+		return tx.Save(&order).Error
+	})
+
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Sales Order berhasil dibatalkan",
+		"data": gin.H{
+			"sales_order_id": id,
+			"status": "CANCELLED",
+		},
+	})
 }
