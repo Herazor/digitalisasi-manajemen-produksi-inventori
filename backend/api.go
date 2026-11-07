@@ -28,6 +28,7 @@ func setupRoutes() *gin.Engine {
 		api.PUT("/products/:id", updateProduct)
 		api.DELETE("/products/:id", deleteProduct)
 		api.POST("/products/:id/boms", createBOM)
+		api.POST("/products/:id/bom-explosion", bomExplosion)
 	}
 
 	return r
@@ -357,5 +358,68 @@ if bomCount > 0 {
 	c.JSON(http.StatusCreated, gin.H{
 		"message": "BOM berhasil dibuat",
 		"data":    createdBOM,
+	})
+}
+
+type BOMExplosionRequest struct {
+	Quantity float64 `json:"quantity" binding:"required,gt=0"`
+}
+
+func bomExplosion(c *gin.Context) {
+	productID, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "ID product tidak valid",
+		})
+		return
+	}
+
+	var req BOMExplosionRequest
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Quantity harus lebih dari 0",
+		})
+		return
+	}
+
+	var bom BOM
+
+	err = db.Preload("Product").
+		Preload("Items.Material").
+		Where("product_id = ? AND is_active = ?", productID, true).
+		First(&bom).Error
+
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "BOM aktif tidak ditemukan",
+		})
+		return
+	}
+
+	var requirements []gin.H
+
+	for _, item := range bom.Items {
+		totalQuantity := item.Quantity * req.Quantity
+
+		requirements = append(requirements, gin.H{
+			"material_id":   item.MaterialID,
+			"material_code": item.Material.Code,
+			"material_name": item.Material.Name,
+			"quantity_per_product": item.Quantity,
+			"total_quantity": totalQuantity,
+			"unit": item.Unit,
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "BOM explosion berhasil",
+		"data": gin.H{
+			"product_id":   bom.ProductID,
+			"product_name": bom.Product.Name,
+			"bom_version":  bom.Version,
+			"production_quantity": req.Quantity,
+			"materials": requirements,
+		},
 	})
 }
