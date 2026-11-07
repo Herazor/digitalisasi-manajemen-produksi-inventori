@@ -39,6 +39,8 @@ func main() {
    		&ProductInventory{},
     	&BOM{},
     	&BOMItem{},
+		&WorkOrder{},
+    	&WorkOrderItem{},
 )
 
 	if err != nil {

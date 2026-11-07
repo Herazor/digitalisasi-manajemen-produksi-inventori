@@ -5,6 +5,9 @@ import (
 	"net/http"
 	"strconv"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+	"sort"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -21,6 +24,8 @@ func setupRoutes() *gin.Engine {
 		api.GET("/materials/:id", getMaterial)
 		api.PUT("/materials/:id", updateMaterial)
 		api.DELETE("/materials/:id", deleteMaterial)
+		api.GET("/inventory/materials", getMaterialInventory)
+		api.POST("/materials/:id/stock", stockInMaterial)
 
 		api.GET("/products", getProducts)
 		api.POST("/products", createProduct)
@@ -29,6 +34,11 @@ func setupRoutes() *gin.Engine {
 		api.DELETE("/products/:id", deleteProduct)
 		api.POST("/products/:id/boms", createBOM)
 		api.POST("/products/:id/bom-explosion", bomExplosion)
+		api.POST("/work-orders", createWorkOrder)
+		api.GET("/work-orders", getWorkOrders)
+		api.POST("/work-orders/:id/complete", completeWorkOrder)
+		api.GET("/inventory/products", getProductInventory)
+		
 	}
 
 	return r
@@ -422,4 +432,390 @@ func bomExplosion(c *gin.Context) {
 			"materials": requirements,
 		},
 	})
+}
+
+func getMaterialInventory(c *gin.Context) {
+    var inventories []MaterialInventory
+
+    if err := db.Preload("Material").Find(&inventories).Error; err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{
+            "error": "Gagal mengambil data inventory",
+        })
+        return
+    }
+
+    var results []gin.H
+
+    for _, inventory := range inventories {
+        available := inventory.OnHand - inventory.Reserved
+
+        results = append(results, gin.H{
+            "material_id":   inventory.MaterialID,
+            "material_code": inventory.Material.Code,
+            "material_name": inventory.Material.Name,
+            "base_unit":     inventory.Material.BaseUnit,
+            "on_hand":       inventory.OnHand,
+            "reserved":      inventory.Reserved,
+            "available":     available,
+        })
+    }
+
+    c.JSON(http.StatusOK, gin.H{
+        "message": "Data inventory berhasil diambil",
+        "data":    results,
+    })
+}
+
+type StockInRequest struct {
+    Quantity float64 `json:"quantity" binding:"required,gt=0"`
+}
+
+func stockInMaterial(c *gin.Context) {
+    materialID, err := strconv.ParseUint(c.Param("id"), 10, 64)
+    if err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{
+            "error": "ID material tidak valid",
+        })
+        return
+    }
+
+    var req StockInRequest
+
+    if err := c.ShouldBindJSON(&req); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{
+            "error": "Quantity harus lebih dari 0",
+        })
+        return
+    }
+
+    err = db.Transaction(func(tx *gorm.DB) error {
+        var inventory MaterialInventory
+
+        // Mengunci baris inventory selama transaksi.
+        if err := tx.Clauses(clause.Locking{
+            Strength: "UPDATE",
+        }).Where("material_id = ?", materialID).
+            First(&inventory).Error; err != nil {
+            return err
+        }
+
+        // Menambahkan stok bahan baku.
+        inventory.OnHand += req.Quantity
+
+        if err := tx.Save(&inventory).Error; err != nil {
+            return err
+        }
+
+        return nil
+    })
+
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{
+            "error": "Gagal menambahkan stok. Pastikan material dan inventory tersedia.",
+        })
+        return
+    }
+
+    c.JSON(http.StatusOK, gin.H{
+        "message": "Stok bahan baku berhasil ditambahkan",
+        "data": gin.H{
+            "material_id": materialID,
+            "stock_added": req.Quantity,
+        },
+    })
+}
+
+type CreateWorkOrderRequest struct {
+    ProductID uint    `json:"product_id" binding:"required"`
+    Quantity  float64 `json:"quantity" binding:"required,gt=0"`
+}
+
+func createWorkOrder(c *gin.Context) {
+    var req CreateWorkOrderRequest
+
+    if err := c.ShouldBindJSON(&req); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{
+            "error": "Product ID dan quantity harus valid",
+        })
+        return
+    }
+
+    var result WorkOrder
+
+    err := db.Transaction(func(tx *gorm.DB) error {
+
+        // 1. Ambil BOM aktif beserta material.
+        var bom BOM
+
+        if err := tx.Preload("Product").
+            Preload("Items.Material").
+            Where("product_id = ? AND is_active = ?", req.ProductID, true).
+            First(&bom).Error; err != nil {
+            return fmt.Errorf("BOM aktif tidak ditemukan")
+        }
+
+        // 2. Hitung kebutuhan material.
+        var items []WorkOrderItem
+
+        for _, item := range bom.Items {
+            if item.Unit != item.Material.BaseUnit {
+                return fmt.Errorf(
+                    "unit BOM tidak sesuai dengan unit material: %s",
+                    item.Material.Name,
+                )
+            }
+
+            required := item.Quantity * req.Quantity
+
+            items = append(items, WorkOrderItem{
+                MaterialID:       item.MaterialID,
+                RequiredQuantity: required,
+                IssuedQuantity:   0,
+                Unit:             item.Unit,
+            })
+        }
+
+        // 3. Urutkan material agar penguncian konsisten.
+        sort.Slice(items, func(i, j int) bool {
+            return items[i].MaterialID < items[j].MaterialID
+        })
+
+        // 4. Kunci inventory dan reservasi stok.
+        for _, item := range items {
+            var inventory MaterialInventory
+
+            if err := tx.Clauses(clause.Locking{
+                Strength: "UPDATE",
+            }).Where("material_id = ?", item.MaterialID).
+                First(&inventory).Error; err != nil {
+                return fmt.Errorf(
+                    "inventory material %d tidak ditemukan",
+                    item.MaterialID,
+                )
+            }
+
+            available := inventory.OnHand - inventory.Reserved
+
+            if available < item.RequiredQuantity {
+                return fmt.Errorf(
+                    "stok material %d tidak mencukupi: tersedia %.2f, dibutuhkan %.2f",
+                    item.MaterialID,
+                    available,
+                    item.RequiredQuantity,
+                )
+            }
+
+            inventory.Reserved += item.RequiredQuantity
+
+            if err := tx.Save(&inventory).Error; err != nil {
+                return err
+            }
+        }
+
+        // 5. Buat Work Order.
+        result = WorkOrder{
+            OrderNumber: fmt.Sprintf("WO-%d", time.Now().UnixNano()),
+            ProductID:   req.ProductID,
+            BOMID:       bom.ID,
+            BOMVersion:  bom.Version,
+            Quantity:    req.Quantity,
+            Status:      "RESERVED",
+        }
+
+        if err := tx.Create(&result).Error; err != nil {
+            return err
+        }
+
+        // 6. Simpan snapshot kebutuhan material.
+        for i := range items {
+            items[i].WorkOrderID = result.ID
+        }
+
+        if err := tx.Create(&items).Error; err != nil {
+            return err
+        }
+
+        return nil
+    })
+
+    if err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{
+            "error": err.Error(),
+        })
+        return
+    }
+
+    c.JSON(http.StatusCreated, gin.H{
+        "message": "Work Order berhasil dibuat dan material berhasil direservasi",
+        "data":    result,
+    })
+}
+
+func getWorkOrders(c *gin.Context) {
+    var workOrders []WorkOrder
+
+    if err := db.Preload("Product").
+        Preload("Items.Material").
+        Order("created_at DESC").
+        Find(&workOrders).Error; err != nil {
+
+        c.JSON(http.StatusInternalServerError, gin.H{
+            "error": "Gagal mengambil data Work Order",
+        })
+        return
+    }
+
+    c.JSON(http.StatusOK, gin.H{
+        "message": "Data Work Order berhasil diambil",
+        "data":    workOrders,
+    })
+}
+
+func completeWorkOrder(c *gin.Context) {
+    workOrderID, err := strconv.ParseUint(c.Param("id"), 10, 64)
+    if err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{
+            "error": "ID Work Order tidak valid",
+        })
+        return
+    }
+
+    err = db.Transaction(func(tx *gorm.DB) error {
+
+        // 1. Kunci Work Order.
+        var workOrder WorkOrder
+
+        if err := tx.Clauses(clause.Locking{
+            Strength: "UPDATE",
+        }).First(&workOrder, workOrderID).Error; err != nil {
+            return fmt.Errorf("Work Order tidak ditemukan")
+        }
+
+        // 2. Pastikan Work Order belum selesai.
+        if workOrder.Status != "RESERVED" {
+            return fmt.Errorf("Work Order tidak dalam status RESERVED")
+        }
+
+        // 3. Ambil daftar kebutuhan material.
+        var items []WorkOrderItem
+
+        if err := tx.Where("work_order_id = ?", workOrder.ID).
+            Find(&items).Error; err != nil {
+            return err
+        }
+
+        if len(items) == 0 {
+            return fmt.Errorf("Work Order tidak memiliki item material")
+        }
+
+        // 4. Urutkan material untuk mencegah deadlock.
+        sort.Slice(items, func(i, j int) bool {
+            return items[i].MaterialID < items[j].MaterialID
+        })
+
+        // 5. Potong stok bahan baku.
+        for _, item := range items {
+            var inventory MaterialInventory
+
+            if err := tx.Clauses(clause.Locking{
+                Strength: "UPDATE",
+            }).Where("material_id = ?", item.MaterialID).
+                First(&inventory).Error; err != nil {
+                return err
+            }
+
+            if inventory.OnHand < item.RequiredQuantity ||
+                inventory.Reserved < item.RequiredQuantity {
+                return fmt.Errorf(
+                    "stok material %d tidak mencukupi untuk penyelesaian",
+                    item.MaterialID,
+                )
+            }
+
+            inventory.OnHand -= item.RequiredQuantity
+            inventory.Reserved -= item.RequiredQuantity
+
+            if err := tx.Save(&inventory).Error; err != nil {
+                return err
+            }
+
+            item.IssuedQuantity = item.RequiredQuantity
+
+            if err := tx.Save(&item).Error; err != nil {
+                return err
+            }
+        }
+
+        // 6. Kunci inventory produk jadi.
+        var productInventory ProductInventory
+
+        if err := tx.Clauses(clause.Locking{
+            Strength: "UPDATE",
+        }).Where("product_id = ?", workOrder.ProductID).
+            First(&productInventory).Error; err != nil {
+            return fmt.Errorf("Inventory produk tidak ditemukan")
+        }
+
+        // 7. Tambahkan stok produk jadi.
+        productInventory.OnHand += workOrder.Quantity
+
+        if err := tx.Save(&productInventory).Error; err != nil {
+            return err
+        }
+
+        // 8. Ubah status Work Order.
+        workOrder.Status = "COMPLETED"
+
+        if err := tx.Save(&workOrder).Error; err != nil {
+            return err
+        }
+
+        return nil
+    })
+
+    if err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{
+            "error": err.Error(),
+        })
+        return
+    }
+
+    c.JSON(http.StatusOK, gin.H{
+        "message": "Work Order berhasil diselesaikan",
+        "data": gin.H{
+            "work_order_id": workOrderID,
+            "status":        "COMPLETED",
+        },
+    })
+}
+
+func getProductInventory(c *gin.Context) {
+    var inventories []ProductInventory
+
+    if err := db.Preload("Product").Find(&inventories).Error; err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{
+            "error": "Gagal mengambil data inventory produk",
+        })
+        return
+    }
+
+    var results []gin.H
+
+    for _, inventory := range inventories {
+        available := inventory.OnHand - inventory.Reserved
+
+        results = append(results, gin.H{
+            "product_id":   inventory.ProductID,
+            "product_code": inventory.Product.Code,
+            "product_name": inventory.Product.Name,
+            "on_hand":      inventory.OnHand,
+            "reserved":     inventory.Reserved,
+            "available":    available,
+        })
+    }
+
+    c.JSON(http.StatusOK, gin.H{
+        "message": "Data inventory produk berhasil diambil",
+        "data":    results,
+    })
 }

@@ -67,3 +67,29 @@ type BOMItem struct {
 
     Material Material `gorm:"foreignKey:MaterialID" json:"material,omitempty"`
 }
+
+type WorkOrder struct {
+    ID          uint   `gorm:"primaryKey" json:"id"`
+    OrderNumber string `gorm:"uniqueIndex;not null" json:"order_number"`
+    ProductID   uint   `json:"product_id"`
+    BOMID       uint   `json:"bom_id"`
+    BOMVersion  int    `json:"bom_version"`
+    Quantity    float64 `json:"quantity"`
+    Status      string `json:"status"`
+
+    Product Product `gorm:"foreignKey:ProductID" json:"product"`
+    Items   []WorkOrderItem `gorm:"foreignKey:WorkOrderID" json:"items"`
+
+    CreatedAt time.Time `json:"created_at"`
+}
+
+type WorkOrderItem struct {
+    ID                uint    `gorm:"primaryKey" json:"id"`
+    WorkOrderID       uint    `json:"work_order_id"`
+    MaterialID        uint    `json:"material_id"`
+    RequiredQuantity  float64 `json:"required_quantity"`
+    IssuedQuantity    float64 `json:"issued_quantity"`
+    Unit              string  `json:"unit"`
+
+    Material Material `gorm:"foreignKey:MaterialID" json:"material"`
+}
